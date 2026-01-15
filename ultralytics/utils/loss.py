@@ -126,10 +126,29 @@ class BboxLoss(nn.Module):
         imgsz: torch.Tensor,
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for bounding boxes."""
+        """Compute IoU and DFL losses for bounding boxes with optional Focaler-GCD loss."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # ==================== YOLO12 Custom: Add Focaler-GCD Loss ====================
+        # Import the custom loss function from metrics
+        from .metrics import focaler_gcd_loss
+        
+        # Calculate Focaler-GCD loss
+        focaler_gcd = focaler_gcd_loss(
+            pred_bboxes[fg_mask], 
+            target_bboxes[fg_mask],
+            tau=2.0,      # Recommended 2.0 for small objects
+            d=0.0,        # Focaler lower bound
+            u=1.0         # Focaler upper bound
+        )
+        
+        # Combine IoU and GCD losses with ratio (default 0.3 for IoU, 0.7 for GCD)
+        iou_ratio = 0.3
+        gcd_loss_value = ((1.0 - focaler_gcd) * weight).sum() / target_scores_sum
+        loss_iou = iou_ratio * loss_iou + (1 - iou_ratio) * gcd_loss_value
+        # ==================== End of YOLO12 Custom ====================
 
         # DFL loss
         if self.dfl_loss:

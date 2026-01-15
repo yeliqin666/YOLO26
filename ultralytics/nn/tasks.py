@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from .AddModules import *
+
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -246,6 +248,10 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
+                # Support for custom UniRepLKNetBlock from YOLO12
+                if 'UniRepLKNetBlock' in globals() and isinstance(m, UniRepLKNetBlock):
+                    m.reparameterize()
+                    LOGGER.info("Switch model to UniRepLKNetBlock")
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
             self.info(verbose=verbose)
@@ -285,9 +291,15 @@ class BaseModel(torch.nn.Module):
         """
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(
-            m, Detect
-        ):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect, YOLOEDetect, YOLOESegment
+        # Support for both standard Detect and custom Detect heads from YOLO12
+        detect_types = [Detect]
+        # Add custom detect heads if available
+        for custom_detect in ['Detect_PPA', 'Detect_EMA_DyHead', 'Detect_EMA_Lite', 
+                               'Detect_WavFreq', 'Detect_WavFreq_Lite']:
+            if custom_detect in globals():
+                detect_types.append(globals()[custom_detect])
+        
+        if isinstance(m, tuple(detect_types)):
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
@@ -1652,25 +1664,40 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in frozenset(
-            {
-                Detect,
-                WorldDetect,
-                YOLOEDetect,
-                Segment,
-                Segment26,
-                YOLOESegment,
-                YOLOESegment26,
-                Pose,
-                Pose26,
-                OBB,
-                OBB26,
-            }
-        ):
+        # Build detect heads set including custom ones from YOLO12
+        detect_heads = {
+            Detect,
+            WorldDetect,
+            YOLOEDetect,
+            Segment,
+            Segment26,
+            YOLOESegment,
+            YOLOESegment26,
+            Pose,
+            Pose26,
+            OBB,
+            OBB26,
+        }
+        # Add custom detect heads if available
+        for custom_head in ['Detect_PPA', 'Detect_EMA_DyHead', 'Detect_EMA_Lite', 
+                            'Detect_WavFreq', 'Detect_WavFreq_Lite']:
+            if custom_head in globals():
+                detect_heads.add(globals()[custom_head])
+        
+        if m in frozenset(detect_heads):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+            # Set legacy flag for detect heads
+            legacy_heads = {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, 
+                           YOLOESegment26, Pose, Pose26, OBB, OBB26}
+            # Add custom detect heads if available
+            for custom_head in ['Detect_EMA_DyHead', 'Detect_EMA_Lite', 
+                               'Detect_WavFreq', 'Detect_WavFreq_Lite']:
+                if custom_head in globals():
+                    legacy_heads.add(globals()[custom_head])
+            
+            if m in legacy_heads:
                 m.legacy = legacy
         elif m is v10Detect:
             args.append([ch[x] for x in f])
@@ -1688,6 +1715,25 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        # YOLO12 custom modules special handling
+        elif 'AVG' in globals() and m is AVG:
+            c2 = ch[f]
+        elif 'EUCB' in globals() and m in {EUCB}:
+            c2 = ch[f]
+            args = [c2, *args]
+        elif 'DPCF' in globals() and m is DPCF:
+            # DPCF(in_features, out_features)
+            # Assumes two inputs with the same number of channels
+            c1 = ch[f[0]]  # Get c1 from first input source
+            c2 = args[0]   # Get c2 from yaml args
+            args = [c1, *args]
+        elif 'MDCR' in globals() and m is MDCR:
+            # MDCR only has one input (f), so we use ch[f]
+            c1 = ch[f]
+            c2 = args[0]
+            args = [c1, *args]
+        elif 'A2C2f_WaveletSparse' in globals() and m in {A2C2f_WaveletSparse}:
+            args = [ch[f], c2, n, *args[3:]]
         else:
             c2 = ch[f]
 

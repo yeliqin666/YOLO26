@@ -1535,6 +1535,103 @@ class ClassifyMetrics(SimpleClass, DataExportMixin):
         """
         return [{"top1_acc": round(self.top1, decimals), "top5_acc": round(self.top5, decimals)}]
 
+# ==================== YOLO12 Custom Loss Functions ====================
+# These functions are added from YOLO12 for enhanced bbox loss computation
+
+def gcd_loss(pred, target, tau=2.0, eps=1e-7):
+    """
+    Fixed GCD Loss - Corrected dimension broadcasting bug
+    
+    Args:
+        pred (torch.Tensor): Predicted bounding boxes in xyxy format, shape (N, 4)
+        target (torch.Tensor): Target bounding boxes in xyxy format, shape (N, 4)
+        tau (float): Adaptive normalization parameter for small objects (recommended: 2.0)
+        eps (float): Small value to avoid division by zero
+        
+    Returns:
+        torch.Tensor: GCD similarity scores, shape (N, 1), range [0, 1]
+    """
+    # 1. Ensure input is 2D (N, 4)
+    if pred.dim() == 1:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    
+    # 2. Unpack coordinates - maintain (N, 1) shape
+    # Note: Use slicing [:, 0:1] instead of indexing [:, 0] to keep dimensions
+    pred_x1, pred_y1, pred_x2, pred_y2 = pred[:, 0:1], pred[:, 1:2], pred[:, 2:3], pred[:, 3:4]
+    target_x1, target_y1, target_x2, target_y2 = target[:, 0:1], target[:, 1:2], target[:, 2:3], target[:, 3:4]
+    
+    # 3. Calculate center points and width/height (N, 1)
+    pred_cx = (pred_x1 + pred_x2) / 2.0
+    pred_cy = (pred_y1 + pred_y2) / 2.0
+    pred_w = (pred_x2 - pred_x1).clamp(min=eps)
+    pred_h = (pred_y2 - pred_y1).clamp(min=eps)
+    
+    target_cx = (target_x1 + target_x2) / 2.0
+    target_cy = (target_y1 + target_y2) / 2.0
+    target_w = (target_x2 - target_x1).clamp(min=eps)
+    target_h = (target_y2 - target_y1).clamp(min=eps)
+    
+    # 4. Geometric calculations (all variables have shape N, 1)
+    center_dist_sq = (pred_cx - target_cx) ** 2 + (pred_cy - target_cy) ** 2
+    
+    pred_var_w = (pred_w ** 2) / 12.0
+    pred_var_h = (pred_h ** 2) / 12.0
+    target_var_w = (target_w ** 2) / 12.0
+    target_var_h = (target_h ** 2) / 12.0
+    
+    trace_sum = pred_var_w + pred_var_h + target_var_w + target_var_h
+    sqrt_w = torch.sqrt((pred_var_w * target_var_w).clamp(min=eps))
+    sqrt_h = torch.sqrt((pred_var_h * target_var_h).clamp(min=eps))
+    cross_term = 2.0 * (sqrt_w + sqrt_h)
+    
+    gcd_sq = (center_dist_sq + trace_sum - cross_term).clamp(min=0.0)
+    
+    # 5. Adaptive normalization
+    target_area = (target_w * target_h).clamp(min=eps)
+    scale_sq = target_area / (tau ** 2)
+    gcd_normalized = (gcd_sq / (scale_sq + eps)).clamp(max=50.0)
+    
+    # 6. Convert to similarity [0, 1]
+    # Key fix: removed .squeeze(-1) to ensure return shape is (N, 1)
+    similarity = torch.exp(-gcd_normalized)
+    
+    return similarity
+
+
+def focaler_gcd_loss(pred, target, tau=2.0, d=0.0, u=1.0, eps=1e-7):
+    """
+    Focaler-GCD Loss Wrapper
+    
+    Combines GCD loss with Focaler mapping for improved small object detection.
+    
+    Args:
+        pred (torch.Tensor): Predicted bounding boxes in xyxy format, shape (N, 4)
+        target (torch.Tensor): Target bounding boxes in xyxy format, shape (N, 4)
+        tau (float): GCD normalization parameter (recommended: 2.0 for small objects)
+        d (float): Focaler lower bound, default 0.0
+        u (float): Focaler upper bound, default 1.0
+        eps (float): Small value to avoid division by zero
+        
+    Returns:
+        torch.Tensor: Focaler-mapped similarity scores, shape (N, 1), range [d, u]
+    """
+    gcd_sim = gcd_loss(pred, target, tau=tau, eps=eps)
+    
+    # Focaler mapping
+    focaler_sim = (d + (u - d) * gcd_sim).clamp(0.0, 1.0)
+    
+    # Ensure return shape is (N, 1) to match YOLOv8 weight shape
+    if focaler_sim.dim() == 1:
+        focaler_sim = focaler_sim.unsqueeze(-1)
+        
+    return focaler_sim
+
+# ==================== End of YOLO12 Custom Functions ====================
+
+
+
 
 class OBBMetrics(DetMetrics):
     """Metrics for evaluating oriented bounding box (OBB) detection.
